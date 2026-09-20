@@ -60,6 +60,8 @@ services:
       RPC_URL: http://besu1:8545
       NODE_URLS: http://besu1:8545,http://besu2:8545,http://besu3:8545,http://besu4:8545
       APP_ORIGIN: ${APP_ORIGIN:-http://localhost:8080}
+      AUDIT_AI_URL: ${AUDIT_AI_URL:-}
+      AUDIT_AI_MODEL: ${AUDIT_AI_MODEL:-}
     volumes:
       - ./generated/deployment.json:/app/generated/deployment.json:ro
       - ./generated/artifacts.json:/app/generated/artifacts.json:ro

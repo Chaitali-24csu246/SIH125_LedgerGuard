@@ -1,4 +1,5 @@
 import express from 'express';
+import {summarizeEvidence,explainEvidence} from './audit-assistant.mjs';
 import helmet from 'helmet';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -10,7 +11,7 @@ const address=z.string().refine(v=>{try{getAddress(v);return true;}catch{return 
 const idSchema=z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const ZERO='0x0000000000000000000000000000000000000000';
 const roles=['Unassigned','Admin','Manager','Auditor','User'];
-export async function createApp({pool,provider,deployment,artifacts,encryptionKey,origin='http://localhost:8080',nodeUrls=[],advisory=true,rateLimit=120}) {
+export async function createApp({pool,provider,deployment,artifacts,encryptionKey,origin='http://localhost:8080',nodeUrls=[],advisory=true,rateLimit=120,auditAI={}}) {
  if(encryptionKey.length!==32) throw Error('Encryption key must contain 32 bytes');
  await pool.query(fs.readFileSync(new URL('./schema.sql',import.meta.url),'utf8'));
  const registry=new Contract(deployment.registry,artifacts.IdentityRegistry.abi,provider);
@@ -153,6 +154,53 @@ export async function createApp({pool,provider,deployment,artifacts,encryptionKe
   const anchored=new Set(anchors.filter(x=>x.args.category==='security-log').map(x=>x.args.digest.slice(2)));
   const anchorMatches=rows.filter(r=>anchored.has(r.digest)).map(r=>r.id);
   res.json({logs:rows.slice(-200).reverse(),verification,anchorMatches,anchorCount:anchored.size,missingAnchors:[...anchored].filter(h=>!rows.some(r=>r.digest===h))});
+ }));
+ const auditJobs=new Set();
+ app.post('/api/audit-assistant',auditor,wrap(async(req,res)=>{
+  const b=z.object({hours:z.number().int().min(1).max(168).default(24),identity:address.optional(),transactionHashes:z.array(z.string().regex(/^0x[a-fA-F0-9]{64}$/)).max(5).default([]),useAI:z.boolean().default(false)}).strict().parse(req.body);
+  if(auditJobs.size>=2)return res.status(429).json({error:'Audit assistant busy. Try again shortly.'});
+  const bucket='audit-assistant:'+req.identity.toLowerCase();
+  await pool.query('DELETE FROM rate_limits WHERE bucket=$1 AND expires_at < now()',[bucket]);
+  const quota=await pool.query("INSERT INTO rate_limits(bucket,hits,expires_at) VALUES($1,1,now() + interval '1 minute') ON CONFLICT(bucket) DO UPDATE SET hits=rate_limits.hits+1 RETURNING hits",[bucket]);
+  if(quota.rows[0].hits>3)return res.status(429).json({error:'Limit: three audit reports per identity per minute.'});
+  if(auditJobs.size>=2)return res.status(429).json({error:'Audit assistant busy. Try again shortly.'});
+  const job=crypto.randomUUID();auditJobs.add(job);
+  try{
+   const now=new Date(),since=new Date(now.getTime()-b.hours*3600000).toISOString(),until=now.toISOString();
+   const rows=(await pool.query('SELECT id,at,actor,action,outcome,digest FROM security_logs WHERE at >= $1 AND at <= $2'+(b.identity?' AND lower(actor)=$3':'')+' ORDER BY id DESC LIMIT 101',b.identity?[since,until,b.identity.toLowerCase()]:[since,until])).rows;
+   const evidence=rows.slice(0,100).map(r=>({id:'log:'+r.id,source:'security',at:r.at,actor:r.actor,action:r.action.slice(0,80),outcome:r.outcome,digest:r.digest}));
+   const head=await provider.getBlockNumber(),from=Math.max(deployment.blockNumber||0,head-1999);
+   const events=await chainEvents(from,head),blocks=new Map();
+   let matching=events;
+   if(b.identity)matching=events.filter(e=>Object.values(e.args).some(v=>typeof v==='string'&&v.toLowerCase()===b.identity.toLowerCase()));
+   const candidates=matching.slice(0,100);
+   for(const e of candidates){
+    if(!blocks.has(e.blockNumber))blocks.set(e.blockNumber,await provider.getBlock(e.blockNumber));
+    const block=blocks.get(e.blockNumber);if(!block)continue;
+    const at=new Date(block.timestamp*1000).toISOString();if(at<since||at>until)continue;
+    const args=Object.fromEntries(Object.entries(e.args).filter(([,v])=>typeof v==='boolean'||(typeof v==='string'&&(/^(0x[a-fA-F0-9]+|[0-9]+)$/.test(v)))));
+    evidence.push({id:'chain:'+e.transactionHash+':'+e.index,source:'chain',at,event:e.event,args,transactionHash:e.transactionHash,blockNumber:e.blockNumber});
+   }
+   const receiptNotes=[];
+   for(const hash of [...new Set(b.transactionHashes)]){
+    const tx=await provider.getTransaction(hash),receipt=await provider.getTransactionReceipt(hash);
+    if(!tx||![deployment.registry,deployment.platform].some(a=>a.toLowerCase()===tx.to?.toLowerCase())){receiptNotes.push({hash,note:'Not a transaction to a LedgerGuard contract.'});continue;}
+    if(!receipt){receiptNotes.push({hash,note:'No mined receipt available.'});continue;}
+    const block=await provider.getBlock(receipt.blockNumber);if(!block)continue;
+    const at=new Date(block.timestamp*1000).toISOString();
+    // A controller address is not interchangeable with a stable identity after rotation.
+    if(b.identity){receiptNotes.push({hash,note:'Receipt excluded from identity-filtered report; historical controller attribution is not established.'});continue;}
+    if(at<since||at>until){receiptNotes.push({hash,note:'Outside selected time window.'});continue;}
+    evidence.push({id:'tx:'+hash,source:'receipt',at,from:tx.from,to:tx.to,outcome:receipt.status===1?'CONFIRMED':'REVERTED',transactionHash:hash,blockNumber:receipt.blockNumber});
+   }
+   const summary=summarizeEvidence(evidence);
+   const ai=b.useAI&&evidence.length?await explainEvidence(evidence,summary,auditAI):{mode:'rules-only',findings:[],notice:'Rule-calculated report. AI explanation was not requested or no evidence was found.'};
+   // Recheck after potentially slow inference; revoked audit authority cannot receive the report.
+   if(!await registry.active(req.identity)||await platform.suspended(req.identity)||!await platform.can(req.identity,2))return res.status(403).json({error:'Audit permission changed during report generation'});
+   const session=(await pool.query('SELECT * FROM sessions WHERE token_hash=$1 AND expires_at > now()',[req.tokenHash])).rows[0];
+   if(!session||Number(await registry.versionOf(req.identity))!==Number(session.identity_version))return res.status(401).json({error:'Session changed. Sign in again.'});
+   res.json({generatedAt:until,window:{since,until,identity:b.identity||null},coverage:{fromBlock:from,toBlock:head,securityTruncated:rows.length>100,chainTruncated:matching.length>100},...summary,...ai,evidence,receiptNotes,limitations:['Bounded sample: up to 100 application records and 100 contract events from the latest 2000 blocks. Counts describe included evidence only.','Reverted transactions require supplied receipt hashes; contract events alone do not include failures.','Application log digests are references, not proof of log completeness or verified checkpoints in this report.','Identity matching uses recorded actor/event addresses, not reconstructed historical wallet ownership.','No conclusion that the system is attack-free can be drawn from this report.']});
+  }finally{auditJobs.delete(job);}
  }));
  app.get('/api/reports',auditor,wrap(async(req,res)=>res.json((await pool.query('SELECT * FROM experiment_reports ORDER BY created_at DESC LIMIT 20')).rows)));
  app.post('/api/reports',admin,wrap(async(req,res)=>{
