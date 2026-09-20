@@ -90,3 +90,8 @@ On Linux/macOS, if tools cannot write the mounted output directory, export `LOCA
 4. Capture your own screenshots of Assets, Audit Explorer and Security Results.
 5. Label local verification evidence accurately; never present simulator results as Besu measurements.
 6. Keep a backup of `generated/`, the database and validator data before making experimental modifications.
+
+
+## AI Audit Assistant
+
+The Security Results page includes on-demand, read-only audit reports with an optional local Ollama explanation layer. See [setup, scope and validation](docs/AI_AUDIT_ASSISTANT.md). No model is required for the rules-only report.

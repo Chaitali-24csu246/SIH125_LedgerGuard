@@ -49,6 +49,31 @@ test('Previously authenticated session cannot retain a revoked audit role',async
  await(await f.platform.setRole(f.wallets[2].address,0)).wait();assert.equal((await request(app).get('/api/audit').set(auth(auditor))).status,403);
  await(await f.platform.setRole(f.wallets[2].address,3)).wait();
 });
+test('Audit assistant enforces permissions, filtering, minimised context and receipt scope',async()=>{
+ assert.equal((await request(app).post('/api/audit-assistant').send({})).status,401);
+ assert.equal((await request(app).post('/api/audit-assistant').set(auth(user)).send({})).status,403);
+ assert.equal((await request(app).post('/api/audit-assistant').set(auth(auditor)).send({hours:999})).status,400);
+ const response=await request(app).post('/api/audit-assistant').set(auth(auditor)).send({hours:24,identity:f.wallets[1].address});
+ assert.equal(response.status,200);assert.equal(response.body.mode,'rules-only');
+ assert.ok(response.body.evidence.every(e=>e.source!=='security'||e.actor.toLowerCase()===f.wallets[1].address.toLowerCase()));
+ assert.ok(response.body.evidence.every(e=>!('details' in e)&&!('encrypted' in e)));
+ await(await f.platform.setRole(f.wallets[2].address,0)).wait();
+ assert.equal((await request(app).post('/api/audit-assistant').set(auth(auditor)).send({})).status,403);
+ await(await f.platform.setRole(f.wallets[2].address,3)).wait();
+ const tx=await f.platform.anchorEvidence('0x'+'ab'.repeat(32),'audit-test');await tx.wait();
+ const rejected=await f.platform.connect(f.signers[3]).setPaused(true,{gasLimit:200000});await rejected.wait().catch(()=>{});
+ const receipts=await request(app).post('/api/audit-assistant').set(auth(auditor)).send({transactionHashes:[tx.hash,rejected.hash]});
+ assert.equal(receipts.status,200);assert.equal(receipts.body.counts.confirmed,1);assert.equal(receipts.body.counts.reverted,1);
+});
+test('Audit assistant withholds output if permission is revoked during model inference',async()=>{
+ const configured=await createApp({...f,pool,encryptionKey:crypto.randomBytes(32),advisory:false,rateLimit:10000,auditAI:{url:'http://localhost:11434',model:'test',fetchImpl:async()=>{
+  await(await f.platform.setRole(f.wallets[2].address,0)).wait();
+  return new Response(JSON.stringify({message:{content:'{"findings":[]}'}}));
+ }}});
+ const response=await request(configured.app).post('/api/audit-assistant').set(auth(auditor)).send({useAI:true});
+ assert.equal(response.status,403);assert.equal(response.body.evidence,undefined);
+ await(await f.platform.setRole(f.wallets[2].address,3)).wait();
+});
 test('Suspension and controller rotation invalidate sessions',async()=>{
  await(await f.platform.setSuspended(f.wallets[3].address,true)).wait();assert.equal((await request(app).get('/api/me').set(auth(user))).status,401);
  await(await f.platform.setSuspended(f.wallets[3].address,false)).wait();

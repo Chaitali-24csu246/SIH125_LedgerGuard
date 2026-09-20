@@ -3,3 +3,5 @@
 .receipt-form{padding:20px}.receipt-form form{display:flex;align-items:flex-end;gap:16px}.receipt-form .field{flex:1;margin:0}.receipt-form button{margin-bottom:0}
 
 @media(max-width:650px){.sidebar-bottom{display:flex;gap:12px;margin:8px 0 0;padding:0}.sidebar-bottom .network-label{display:none}.sidebar-bottom>button{width:auto;padding:8px}.sidebar-bottom>button:first-of-type{margin-right:auto}}
+
+.audit-assistant{padding:24px}.audit-assistant textarea{width:100%;min-height:85px;resize:vertical;font:inherit;font-size:.875rem;border:1px solid #cfd9e6;border-radius:6px;padding:10px 12px}.audit-assistant pre{max-height:260px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}.audit-assistant details{margin:16px 0}.audit-assistant summary{cursor:pointer}.audit-assistant textarea:focus-visible{outline:3px solid #7eafff;outline-offset:2px}
